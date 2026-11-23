@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "id": "13sentinelsrecomp",
+  "name": "13SentinelsRecomp",
+  "display_name": "13 Sentinels: Aegis Rim",
+  "version": "v1.0.0-beta1",
+  "platform": "windows-x64",
+  "executable": "13SentinelsRecomp.exe",
+  "icon": "icon.png",
+  "game": {
+    "title": "13 Sentinels: Aegis Rim",
+    "title_ids": [
+      "01008D7016438000",
+      "01003FC01670C000"
+    ],
+    "versions": [
+      {
+        "region": "Asia",
+        "title_id": "01008D7016438000",
+        "version": "1.0.0",
+        "build_id": "311947020F64F5742CE3C16162C4D87F92C68313",
+        "status": "verified",
+        "languages": ["zh-Hans", "zh-Hant", "ko"]
+      },
+      {
+        "region": "US/EU",
+        "title_id": "01003FC01670C000",
+        "version": "1.1.0",
+        "build_id": "4B632573CA5C160EABB70519FB622718956D70EA",
+        "status": "verified",
+        "languages": ["en-US", "fr", "de", "it", "es"]
+      },
+      {
+        "region": "US/EU",
+        "title_id": "01003FC01670C000",
+        "version": "1.0.0",
+        "build_id": "57212E16CB83BB553B7C08493B9484FB836E56C8",
+        "status": "supported_recommend_update",
+        "languages": ["en-US", "fr", "de", "it", "es"]
+      }
+    ],
+    "input": {
+      "type": "extracted_directory",
+      "required_subdirs": ["exefs", "romfs"],
+      "required_exefs_files": ["main", "sdk", "main.npdm"],
+      "optional_exefs_files": ["subsdk0"]
+    }
+  },
+  "cli": {
+    "game_dir_flag": "--game-dir",
+    "build_args": ["--game-dir", "{game_dir}", "--build-only"],
+    "launch_args": ["--game-dir", "{game_dir}", "--play"],
+    "progress": {
+      "stream": "stdout",
+      "pattern": "^progress\\s+([0-9]+(?:\\.[0-9]+)?)\\s+(.*)$",
+      "min": 0.0,
+      "max": 1.0
+    },
+    "output_module_pattern": "lasgame_{build16}.dll"
+  },
+  "config": {
+    "file": "13sentinels.ini",
+    "legacy_fallback": "larecomp.ini",
+    "format": "ini",
+    "settings": [
+      {
+        "key": "window_mode",
+        "section": "display",
+        "type": "enum",
+        "default": "windowed",
+        "options": ["windowed", "borderless", "exclusive"]
+      },
+      {
+        "key": "output_res",
+        "section": "display",
+        "type": "enum",
+        "default": "auto",
+        "options": ["auto", "720p", "1080p", "1440p", "4k"]
+      },
+      {
+        "key": "resolution",
+        "section": "display",
+        "type": "enum",
+        "default": "auto",
+        "options": ["auto", "match", "dynamic", "25%", "50%", "75%", "1x", "1.5x", "2x"]
+      },
+      {
+        "key": "aspect_mode",
+        "section": "display",
+        "type": "enum",
+        "default": "16:9",
+        "options": ["16:9", "stretch"]
+      },
+      {
+        "key": "upscaler",
+        "section": "display",
+        "type": "enum",
+        "default": "auto",
+        "options": ["auto", "fsr1", "bilinear"]
+      },
+      {
+        "key": "antialias",
+        "section": "display",
+        "type": "enum",
+        "default": "off",
+        "options": ["off", "smaa"]
+      },
+      {
+        "key": "vsync_mode",
+        "section": "display",
+        "type": "enum",
+        "default": "mailbox",
+        "options": ["mailbox", "fifo", "immediate"]
+      },
+      {
+        "key": "ui_lang",
+        "section": "language",
+        "type": "enum",
+        "default": "auto",
+        "options": ["auto", "zh-Hans", "zh-Hant", "en", "ja", "ko"]
+      },
+      {
+        "key": "game_lang",
+        "section": "language",
+        "type": "enum",
+        "default": "zh-Hans",
+        "options": ["auto", "zh-Hans", "zh-Hant", "ko", "ja", "en-US", "fr", "de", "it", "es"]
+      },
+      {
+        "key": "pad_layout",
+        "section": "controls",
+        "type": "enum",
+        "default": "nintendo",
+        "options": ["nintendo", "xbox"]
+      },
+      {
+        "key": "volume",
+        "section": "audio",
+        "type": "float",
+        "default": 1.0,
+        "min": 0.0,
+        "max": 1.0
+      }
+    ]
+  },
+  "licenses": {
+    "project": "MIT",
+    "file": "LICENSE",
+    "third_party_file": "THIRD_PARTY_LICENSES.md"
+  }
+}
