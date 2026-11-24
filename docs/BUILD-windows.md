@@ -1,53 +1,105 @@
-# Building LAS Recomp on Windows (x86-64)
+# Building 13SentinelsRecomp on Windows
 
-Status: part of main. Builds and runs the game on Vulkan (with your own game files); `make dist` packages the
-release zip.
+`13SentinelsRecomp` targets **Windows 10 / 11 (x86-64)** using **MSYS2 UCRT64** (`clang` + `lld` + Vulkan 1.3), producing `13SentinelsRecomp.exe` and a self-contained zero-copyright distributable archive (`13SentinelsRecomp-<version>-windows.zip`).
 
-## One-time setup
-Run in PowerShell from the repo root:
+---
 
-    powershell -ExecutionPolicy Bypass -File tools\setup_windows.ps1
+## 1. Prerequisites
 
-This installs MSYS2 (UCRT64: clang, lld, make, SDL3, FFmpeg, Vulkan loader + headers, shaderc, Vulkan Memory
-Allocator, validation layers), Python 3.12 for the tools (`tools\venv`: unicorn, capstone, lz4) and the randomizer
-(`third_party\LAS-Randomizer\venv`) and switches the clone to LF line endings.
+### MSYS2 UCRT64 Packages
 
-## Build
-From an MSYS2 UCRT64 shell, or Git Bash with MSYS2 first on PATH:
+Install MSYS2 and run the following inside an **MSYS2 UCRT64** shell:
 
-    export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"
-    make gen        # once: recompile the game from extracted/exefs (your own game files; see the start screen)
-    make -j         # -> build/lasrecomp.exe and the game code library build/lasgame.dll
+```bash
+pacman -Syuu --noconfirm
+pacman -S --needed --noconfirm \
+  make \
+  mingw-w64-ucrt-x86_64-clang \
+  mingw-w64-ucrt-x86_64-lld \
+  mingw-w64-ucrt-x86_64-sdl3 \
+  mingw-w64-ucrt-x86_64-ffmpeg \
+  mingw-w64-ucrt-x86_64-vulkan-devel \
+  mingw-w64-ucrt-x86_64-shaderc \
+  mingw-w64-ucrt-x86_64-spirv-tools \
+  mingw-w64-ucrt-x86_64-pkgconf \
+  mingw-w64-ucrt-x86_64-gdb \
+  mingw-w64-ucrt-x86_64-vulkan-memory-allocator \
+  mingw-w64-ucrt-x86_64-vulkan-validation-layers \
+  mingw-w64-ucrt-x86_64-nasm
+```
 
-Without `generated/` only the app is built: the start screen builds the game code itself when you set up the game
-files (as for players), given the generator and the compiler (`make gen-helper`, `tools/fetch_zig.sh`).
-`make runtime-objs` compiles the runtime only (quick check).
+### Python 3.12 (Official CPython for Freezing `lasgen`)
 
-Run from a shell that has `C:\msys64\ucrt64\bin` on PATH (SDL3, FFmpeg, Vulkan, shaderc DLLs).
+MSYS2 Python lacks prebuilt wheels for `capstone` and `unicorn`, so freezing the standalone code generator (`lasgen.exe`) uses Windows CPython 3.12 with:
 
-## Package
-    make rando-helper   # the seed generator without Python (build/helper/rando-gen)
-    make gen-helper     # the game code generator without Python (build/helper/lasgen)
-    tools/fetch_zig.sh  # the compiler the start screen builds the game code with (build/zig)
-    make dist           # -> build/dist/LAS Recomp-<version>-windows.zip (no game code inside)
+- `pyinstaller==6.22.3`
+- `capstone==5.0.9`
+- `unicorn==2.1.4`
+- `lz4==4.4.5`
 
-The zip's `LAS Recomp/` folder holds `lasrecomp.exe` (icon from `docs/icon/icon.ico`, via windres),
-`rando-gen/` and the MSYS2 DLLs. No installer: game files, saves, seeds and settings are kept next to the exe, so
-the folder must be writable (the app says so and quits if it isn't, e.g. under Program Files). A source checkout
-with `extracted/` in the starting folder keeps using that folder instead.
+### Git Line Endings
 
-## Differences from macOS
-- Guest window 0x70_0000_0000..0x73_2000_0000 is reserved with VirtualAlloc and committed per region
-  (kernel regions, modules, HLE heap); stray first touches are committed by a vectored exception handler.
-- AArch64 FP/SIMD instructions are lowered to C (`gen.py --simd=c`, the default on non-arm64 hosts) instead of
-  inline-asm passthrough.
-- Renderer: Vulkan (runtime/nvn/vulkan) instead of Metal; shaders are translated to GLSL and compiled with
-  shaderc. macOS keeps Metal.
-- Seed switches and "Title screen" reboot the game in place on both (runtime/main.c); the only re-exec left is
-  the startup retry when the guest window is taken, which on Windows starts a new process and exits.
+Shell scripts under `tools/` require LF endings. Configure Git in the repository clone:
 
-## Tests
-- `tools/test_translate.sh`: shader translator fuzz (MSL output unchanged, GLSL compiles and validates).
-- `tools/test_vk_pipelines.sh`: fuzzed shaders through the backend's compile/reflection into real pipelines.
-- `LARECOMP_VK_VALIDATION=1` with `VK_ADD_LAYER_PATH` pointing at `C:\msys64\ucrt64\bin`: Khronos validation layer.
-- Run test windows directly, not under MSYS `timeout` (it stalls the window).
+```bash
+git config core.autocrlf false
+git config core.eol lf
+```
+
+---
+
+## 2. Quick Development Build (Runtime Only)
+
+In an **MSYS2 UCRT64** shell at the repository root:
+
+```bash
+make -j8
+```
+
+This builds `build/13SentinelsRecomp.exe` (and compatibility shim `build/lasrecomp.exe`) linked against MSYS2's UCRT64 libraries.
+
+---
+
+## 3. Building the Distributable Release Archive (`make dist`)
+
+Release packaging bundles an **LGPL-only** FFmpeg build (instead of MSYS2's GPLv3 FFmpeg), the pinned slimmed Zig toolchain (`zig/`), and the frozen `lasgen/` code generator so end users do not need MSYS2 or Python installed:
+
+```bash
+# 1. Build LGPL FFmpeg 9.0.2 into build/deps-win
+bash tools/build_deps_windows.sh
+
+# 2. Download and verify the pinned Zig 0.17 Windows toolchain into build/zig
+bash tools/fetch_zig.sh
+
+# 3. Freeze the standalone code generator into build/helper/lasgen/
+#    (Omit GEN_PY=... to auto-create build/rando-venv using `py -3.12`)
+make -j8 GEN_PY=/c/Users/<you>/AppData/Local/Programs/Python/Python312/python.exe gen-helper
+
+# 4. Build the release binary (RELEASE=1, no console window) and zip package
+make -j8 dist
+```
+
+The packaged output is written to:
+
+- Folder: `build/dist/13SentinelsRecomp/`
+- Archive: `build/dist/13SentinelsRecomp-<version>-windows.zip` (e.g., `13SentinelsRecomp-v1.0.0-beta1-windows.zip`)
+
+### Package Contents & Privacy Checks
+
+`make dist` verifies that:
+
+- No game functions (`f_70*`) are linked into `13SentinelsRecomp.exe`.
+- No GPL video codec libraries (`x264`, `x265`, `xvid`, `postproc`) are included.
+- Local workspace and `%USERPROFILE%` paths are stripped/absent from distributed binaries and DLLs.
+- `vulkan-1.dll` is intentionally omitted so the host GPU driver's Vulkan 1.3 loader is used.
+
+---
+
+## 4. Runtime Output & Logs
+
+At runtime, `13SentinelsRecomp.exe` keeps user data alongside the executable:
+
+- Built game module: `lasgame_<build16>.dll` (compiled from `exefs/` via `lasgen/` and `zig/`)
+- Configuration: `13sentinels.ini` (automatically migrates settings if a legacy `larecomp.ini` exists)
+- Logs (`RELEASE=1`): `13sentinelsrecomp.log` and up to five rotated `13sentinelsrecomp-backup-*.log` files
+- Backups: `save_backups/`

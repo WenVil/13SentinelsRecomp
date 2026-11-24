@@ -32,7 +32,7 @@ host watchdog policy, not durations decoded from the game.
 The game's vibration graph uses a 5 ms TimerEvent. The kernel must return
 WaitProcessWideKeyAtomic timeout without owning the mutex: the SDK acquires it
 after timeout. Acquiring it in both places deadlocks the update thread. This
-behavior is already present on beta_5 (8a8f74f); no separate kernel PR is required.
+behavior is already present in the upstream LASRecomp runtime kernel.
 
 ## Tests
 
