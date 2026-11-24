@@ -4,6 +4,8 @@
 
 《十三机兵防卫圈 / 13 Sentinels: Aegis Rim》（Nintendo Switch 版）PC 原生静态重编译运行器，基于 [**peiikai/LASRecomp**](https://github.com/peiikai/LASRecomp) 构建。
 
+<a href="https://recomplauncher.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
 ---
 
 ## 版权与合规声明
