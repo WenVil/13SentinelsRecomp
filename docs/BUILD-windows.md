@@ -56,7 +56,7 @@ In an **MSYS2 UCRT64** shell at the repository root:
 make -j8
 ```
 
-This builds `build/13SentinelsRecomp.exe` (and compatibility shim `build/lasrecomp.exe`) linked against MSYS2's UCRT64 libraries.
+This builds `build/13SentinelsRecomp.exe` (and an optional dev-only compatibility shim `build/lasrecomp.exe`, which is omitted from release zips) linked against MSYS2's UCRT64 libraries.
 
 ---
 
