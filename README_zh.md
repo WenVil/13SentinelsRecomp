@@ -118,7 +118,7 @@ make -j8 GEN_PY=/path/to/python.exe gen-helper
 make -j8 dist
 ```
 
-生成的分发压缩包位于 `build/dist/13SentinelsRecomp-v1.0.0-beta1-windows.zip`。
+生成的分发压缩包位于 `build/dist/13SentinelsRecomp-v1.0.0-beta2-windows.zip`。
 
 ---
 

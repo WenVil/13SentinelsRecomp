@@ -19,12 +19,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "13SentinelsRecomp Contributors"
             VALUE "FileDescription",  "13SentinelsRecomp - Static Recompilation Runtime"
-            VALUE "FileVersion",      "1.0.0-beta1"
+            VALUE "FileVersion",      "1.0.0-beta2"
             VALUE "InternalName",     "13SentinelsRecomp"
             VALUE "LegalCopyright",   "MIT License - User-supplied game assets required"
             VALUE "OriginalFilename", "13SentinelsRecomp.exe"
             VALUE "ProductName",      "13SentinelsRecomp"
-            VALUE "ProductVersion",   "1.0.0-beta1"
+            VALUE "ProductVersion",   "1.0.0-beta2"
         END
     END
     BLOCK "VarFileInfo"

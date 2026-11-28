@@ -1,4 +1,5 @@
 // GLSL -> SPIR-V (shaderc), descriptor layouts from the SPIR-V itself, translated NVN programs, built-in shaders.
+#include <SDL3/SDL_timer.h>
 #include <dirent.h>
 #include <pthread.h>
 #include <shaderc/shaderc.h>
@@ -7,6 +8,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "render_diag.h"
 #include "shaders.h"
 #include "../screen_filter.h"
 
@@ -117,11 +119,15 @@ static uint32_t *no_contraction(uint32_t *spv, size_t *nwords) {
 // their depths stopped matching (EQUAL test: black holes in foliage), and it was most of the compile time; the
 // driver optimises anyway. LARECOMP_VK_OPT=1 turns it back on (experiments).
 uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords) {
+    uint64_t t0 = vk_diag_enabled() ? SDL_GetTicksNS() : 0;
     uint64_t h = src_hash(src, stage);
     static int nocache = -1;
     if (nocache < 0) nocache = getenv("LARECOMP_VK_NO_SPIRV_CACHE") != NULL;
     uint32_t *out = nocache ? NULL : cache_load(h, nwords);
-    if (out) return out;
+    if (out) {
+        if (vk_diag_enabled()) vk_diag_spv_result(stage, true, (double)(SDL_GetTicksNS() - t0) / 1e6, true);
+        return out;
+    }
     static __thread shaderc_compiler_t comp;
     if (!comp) comp = shaderc_compiler_initialize();
     shaderc_compile_options_t o = shaderc_compile_options_initialize();
@@ -130,7 +136,9 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
                                                                                   : shaderc_optimization_level_zero);
     shaderc_compilation_result_t r = shaderc_compile_into_spv(comp, src, strlen(src), kind_of(stage), name, "main", o);
     shaderc_compile_options_release(o);
-    if (shaderc_result_get_compilation_status(r) != shaderc_compilation_status_success) {
+    bool ok = shaderc_result_get_compilation_status(r) == shaderc_compilation_status_success;
+    if (vk_diag_enabled()) vk_diag_spv_result(stage, false, (double)(SDL_GetTicksNS() - t0) / 1e6, ok);
+    if (!ok) {
         static int nlog;
         if (nlog++ < 20) LOG("[shader] %s: GLSL compile failed:\n%s\n%s\n", name, shaderc_result_get_error_message(r), src);
     } else {

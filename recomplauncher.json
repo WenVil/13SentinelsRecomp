@@ -552,14 +552,14 @@
         }
       ],
       "defaults": {
-        "game_lang": "zh-Hans"
+        "game_lang": "auto"
       }
     },
     {
       "id": "pad_layout",
       "label": "Controller layout",
       "group": "Controls",
-      "help": "Chooses Nintendo Switch physical positions or Xbox letter positions for face buttons and overlay navigation.",
+      "help": "Chooses Nintendo Switch physical positions or Xbox letter positions for face buttons and overlay navigation. Remaps button inputs and overlay prompts only; does not replace in-game Switch textures.",
       "choices": [
         {
           "label": "Nintendo",

@@ -81,7 +81,7 @@ static void save_png(id<MTLTexture> tex, const char *path) {
 }
 #endif
 
-#define LARECOMP_VERSION "v1.0.0-beta1"
+#define LARECOMP_VERSION "v1.0.0-beta2"
 extern "C" const char *larecomp_version(void) { return LARECOMP_VERSION; }
 
 extern "C" int g_start_screen;

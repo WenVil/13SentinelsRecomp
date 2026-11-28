@@ -42,6 +42,7 @@
 //   pipeline objects    (WAIT_PIPES) R reads Pipe.state / .pipe through the resolver: _Atomic state, the handle
 //                       written by the build worker before the state's release store
 #include "record.h"
+#include "render_diag.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -752,6 +753,7 @@ static void CmdBindPipeline_run(const void *p) {
             ADD(r_pipe_waits, 1);
             ADD(r_pipe_wait_ns, dt);
             ADD(hud_pipe_wait_ns, dt);
+            if (vk_diag_enabled()) vk_diag_rec_pipe_wait((double)dt / 1e6);
         }
     }
     if (a->bp == VK_PIPELINE_BIND_POINT_GRAPHICS) unbound = !pipe;
@@ -775,6 +777,7 @@ void rec_CmdBindPipelineObj(VkCommandBuffer cb, VkPipelineBindPoint bp, void *ob
 }
 static bool draw_dropped(void) {
     if (!unbound) return false;
+    vk_diag_rec_draw_dropped();
     if (!atomic_fetch_add_explicit(&r_dropped, 1, memory_order_relaxed)) LOG("[vk] recorder: a pipeline failed to build: its draws are dropped\n");
     return true;
 }

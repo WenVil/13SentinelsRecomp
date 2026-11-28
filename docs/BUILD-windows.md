@@ -82,7 +82,7 @@ make -j8 dist
 The packaged output is written to:
 
 - Folder: `build/dist/13SentinelsRecomp/`
-- Archive: `build/dist/13SentinelsRecomp-<version>-windows.zip` (e.g., `13SentinelsRecomp-v1.0.0-beta1-windows.zip`)
+- Archive: `build/dist/13SentinelsRecomp-<version>-windows.zip` (e.g., `13SentinelsRecomp-v1.0.0-beta2-windows.zip`)
 
 ### Package Contents & Privacy Checks
 

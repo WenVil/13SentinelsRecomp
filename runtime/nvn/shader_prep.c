@@ -661,6 +661,7 @@ static bool prep_run_locked(const char *romfs, void (*progress)(int done, int to
 
 void shader_prep_boot(const char *romfs) {
     const char *e = getenv("LARECOMP_SHADER_PREP");
-    if (!e || !atoi(e)) return;
+    if (e && *e && !atoi(e)) return;
+    if (!romfs || !*romfs) return;
     shader_prep_run(romfs, NULL, NULL);
 }

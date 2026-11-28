@@ -288,7 +288,7 @@ dist:
 	if [ -f third_party/fonts/DejaVu/DejaVuSans.ttf ]; then \
 	    cp third_party/fonts/DejaVu/DejaVuSans.ttf third_party/fonts/DejaVu/DejaVuSans-Bold.ttf "$(DIST)/"; \
 	    cp third_party/fonts/DejaVu/LICENSE "$(DIST)/DejaVu-LICENSE.txt"; fi
-	cp README.md LICENSE THIRD_PARTY_LICENSES.md recomplauncher.json "$(DIST)/"  # (licenses and launcher metadata)
+	cp README.md README_zh.md LICENSE THIRD_PARTY_LICENSES.md recomplauncher.json "$(DIST)/"  # (licenses and launcher metadata)
 	PATH="$(CURDIR)/build/deps-win/bin:$$PATH" ldd $(WIN_B)/13SentinelsRecomp.exe | awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $$3}' | sort -u | \
 	    xargs -I{} cp -u {} "$(DIST)/"
 	! ls "$(DIST)" | grep -iE 'x264|x265|xvid|postproc'  # (no GPL codec libraries in the release)

@@ -118,7 +118,7 @@ make -j8 GEN_PY=/path/to/python.exe gen-helper
 make -j8 dist
 ```
 
-The distributable archive is written to `build/dist/13SentinelsRecomp-v1.0.0-beta1-windows.zip`.
+The distributable archive is written to `build/dist/13SentinelsRecomp-v1.0.0-beta2-windows.zip`.
 
 ---
 

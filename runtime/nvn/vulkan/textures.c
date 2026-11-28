@@ -10,6 +10,7 @@
 #include "../rqueue.h"
 #include "vk.h"
 #include "record.h"
+#include "render_diag.h"
 #include "../astc.h"
 #include "../tex_hash.h"
 #include "../renderer.h"
@@ -512,6 +513,7 @@ static TexBackend *tex_backend(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
         if (b->scalable && (b->ax != g_al_x || b->ay != g_al_y)) {  // output resolution changed: reallocate
+            vk_diag_tex_event("res_realloc", t, t->width, t->height, t->format, 0, 0, vk_frame_counter());
             destroy_image(b);
             create_image(t, b);
         }
@@ -616,6 +618,8 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     const uint8_t *mem = (const uint8_t *)(uintptr_t)t->addr;
     static int always_full = -1;
     if (always_full < 0) always_full = getenv("LARECOMP_TEX_FULLHASH") ? 1 : 0;
+    uint64_t prev_full_frame = b->full_frame;
+    int watch_ch = -1;
     bool full = b->dynamic || !b->uploaded || always_full;
     bool periodic = frame - b->full_frame >= 120 && full_hash_budget >= total;  // (safety net: a full hash now and then)
     if (!full && periodic) { full = true; full_hash_budget -= total; }
@@ -631,6 +635,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
         extern int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);
         uint32_t now = 0;
         int ch = vk_pages_changed(t->addr, total, b->wgen, &now);
+        watch_ch = ch;
         if (ch >= 0) {
             b->wgen = now;
             if (!ch && b->uploaded && !restyle) {
@@ -654,7 +659,13 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (!fast) b->sample_hash = fnv_sample(mem, total);
     else if (!b->dynamic && !(b->uploaded && h != b->data_hash)) b->sample_hash = tex_hash_sample(mem, total);
     if (b->uploaded && h == b->data_hash && !restyle) return;
-    if (b->uploaded && h != b->data_hash) b->dynamic = true;
+    if (b->uploaded && h != b->data_hash) {
+        if (!b->dynamic) {
+            vk_diag_tex_event("late_hash_change", t, t->width, t->height, t->format, frame - prev_full_frame, watch_ch, frame);
+            vk_diag_tex_event("dynamic_promote", t, t->width, t->height, t->format, 0, 0, frame);
+        }
+        b->dynamic = true;
+    }
     // new contents (the game reused the memory for another image, or the data arrived after the first check): which
     // known texture it is, if any, is decided again before this upload patches it
     if (!identified_now && h != b->data_hash) b->tp = texpatch_marker(t);
@@ -751,7 +762,7 @@ void backend_pool_written(uint64_t addr, uint64_t size) { (void)addr; (void)size
 // Host-produced texel data (decoded video, any thread): applied on the render thread at the texture's next use.
 static void upload_rgba_now(NvnTexture *t, const void *rgba, uint32_t w, uint32_t h, uint32_t stride) {
     TexBackend *b = t->backend;
-    if (!b) return;  // the game binds the texture before decoding into it; first frames may arrive earlier
+    if (!b) { vk_diag_tex_event("pending_drop", t, w, h, t->format, 0, 0, vk_frame_counter()); return; }  // the game binds the texture before decoding into it; first frames may arrive earlier
     void *copy = malloc((size_t)stride * h);
     memcpy(copy, rgba, (size_t)stride * h);
     pthread_mutex_lock(&pending_lock);
@@ -797,7 +808,7 @@ void backend_upload_now(NvnTexture *t, int kind, void *data, uint32_t w, uint32_
 }
 static bool upload_nv12_now(NvnTexture *t, const void *nv12, uint32_t w, uint32_t h, uint32_t stride, uint32_t uv_off) {
     TexBackend *b = t->backend;
-    if (!b) return true;  // (as renderer_upload_rgba: a frame before the texture is first bound is dropped)
+    if (!b) { vk_diag_tex_event("pending_drop", t, w, h, t->format, 0, 0, vk_frame_counter()); return true; }  // (as renderer_upload_rgba: a frame before the texture is first bound is dropped)
     if (!nv12_format_ok(b->format)) return false;
     size_t n = (size_t)uv_off + (size_t)stride * (h / 2);
     void *copy = malloc(n);
@@ -846,11 +857,16 @@ VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uin
     VkImageView v;
     if (vkCreateImageView(g_vk.dev, &vi, NULL, &v) != VK_SUCCESS) {
         static int nfail;
+        vk_diag_tex_event("view_fail", b, b->width, b->height, fmt, 0, 0, vk_frame_counter());
         if (nfail++ < 20) LOG("[vk] view failed: type %d fmt %d (image fmt %d) levels %u+%u layers %u+%u\n", type, fmt, b->format, lv0, nlv, ly0, nly);
         return VK_NULL_HANDLE;
     }
     ViewEnt *e = &view_tab[slot];
-    if (e->b) { defer((Dead){.view = e->view}); vk_view_gen++; }  // evict (16 probes taken)
+    if (e->b) {
+        defer((Dead){.view = e->view});
+        vk_view_gen++;
+        vk_diag_tex_event("view_evict", b, b->width, b->height, fmt, 0, 0, vk_frame_counter());
+    }  // evict (16 probes taken)
     *e = (ViewEnt){b, k1, k2, v};
     return v;
 }

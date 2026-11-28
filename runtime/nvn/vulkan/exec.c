@@ -20,6 +20,7 @@
 #include "shaders.h"
 #include "vk.h"
 #include "record.h"
+#include "render_diag.h"
 #include "../renderer.h"
 #include "../pace.h"
 #include "../recolour.h"
@@ -29,6 +30,7 @@
 
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static _Atomic uint64_t hud_total_draws, hud_total_wait_ns;
+extern uint64_t renderer_exec_frame(void);
 
 void vk_exec_hud_counters(uint64_t *draws, uint64_t *wait_ns) {
     if (draws) *draws = atomic_load_explicit(&hud_total_draws, memory_order_relaxed);
@@ -740,6 +742,7 @@ VkSpan vk_transient(uint64_t size, uint64_t align) {
         if (pick < 0) FATAL("the graphics card ran out of memory for uploads (%llu MB needed, %d chunks in use)\n",
                             (unsigned long long)(size >> 20), nchunks);
         static int nlog;
+        vk_diag_mem_event("transient_gpu_wait", (uint64_t)pick, size, vk_frame_counter());
         if (nlog++ < 5) LOG("[vk] transient ring: reused chunk %d after waiting for the GPU\n", pick);
     }
     active = pick;
@@ -846,6 +849,18 @@ static bool sync_shaders(void) {
     static int v = -1;
     if (v < 0) v = getenv("LARECOMP_SYNC_SHADERS") != NULL;
     return v;
+}
+
+static bool wait_shaders_on(void) { return sync_shaders() || rec_wait_pipes(); }
+
+static int await_ready_state(_Atomic int *state, bool wait) {
+    int s;
+    while ((s = atomic_load(state)) == 0) {
+        if (!wait) return 0;
+        struct timespec ts = {0, 200000};
+        nanosleep(&ts, NULL);
+    }
+    return s;
 }
 
 // Shader translation: one dedicated thread (the translator isn't re-entrant - translate.c's RSC2 string ring - and
@@ -1003,8 +1018,10 @@ static void skip_note(int why, bool compute) {
     }
     skip_top[j].n++;
 }
-#define SKIP(why) do { stat_skipped++; if (log_skips) skip_note(why, false); } while (0)
-#define SKIP_CS(why) do { stat_skipped++; if (log_skips) skip_note(why, true); } while (0)
+static void diag_skip_draw(int why, void *pr_v, void *pp_v, CmdRec *r, bool compute);
+#define SKIP(why) do { stat_skipped++; if (log_skips) skip_note(why, false); diag_skip_draw(why, NULL, NULL, r, false); } while (0)
+#define SKIP_EX(why, pr_, pp_) do { stat_skipped++; if (log_skips) skip_note(why, false); diag_skip_draw(why, pr_, pp_, r, false); } while (0)
+#define SKIP_CS(why) do { stat_skipped++; if (log_skips) skip_note(why, true); diag_skip_draw(why, NULL, NULL, NULL, true); } while (0)
 static void skip_log(void) {
     if (log_skips <= 0) return;
     uint64_t total = 0;
@@ -1246,6 +1263,7 @@ void vk_exec_init(void) {
     }
     rec_set_pipe_resolver(pipe_resolve);
     rec_init(prof != 0);
+    vk_diag_init();
 }
 
 void renderer_texture_scale(NvnTexture *t, float *sx, float *sy);
@@ -1325,6 +1343,7 @@ static void vk_end_pass_at(int line) {
     if (prof && line < 4096) prof_end_line[line]++;
     rec_CmdEndRendering(vk_cmd());
     in_pass = false;
+    if (vk_diag_enabled()) vk_diag_pass_end(renderer_exec_frame());
     if (g_debug_frame && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
         char path[256];
         static uint64_t debug_pass_frame = ~0ull;
@@ -1397,6 +1416,7 @@ static void begin_pass(void) {
     }
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
     uint32_t w = 0, minw = UINT32_MAX, minh = UINT32_MAX;  // w: first attachment seen
+    uint32_t load_clear_mask = 0, fresh_mask = 0, first_write_mask = 0, level_fresh_mask = 0;
     pass_ncolor = (uint32_t)st.rt.ncolor;
     pass_samples = 1;
     for (int i = 0; i < st.rt.ncolor; i++) {
@@ -1412,10 +1432,17 @@ static void begin_pass(void) {
         ca[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        bool fresh = (int)renderer_texture_level_fresh(t) | (int)renderer_texture_frame_fresh(t);  // both: each marks its state
-        if (renderer_texture_first_write(t) || fresh) {
+        bool lf = renderer_texture_level_fresh(t);
+        bool ff = renderer_texture_frame_fresh(t);
+        bool fresh = lf || ff;  // both: each marks its state
+        bool fw = renderer_texture_first_write(t);
+        if (fw || fresh) {
             ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
             ca[i].clearValue.color.float32[3] = fresh ? 0.0f : 1.0f;
+            load_clear_mask |= 1u << i;
+            if (ff) fresh_mask |= 1u << i;
+            if (fw) first_write_mask |= 1u << i;
+            if (lf) level_fresh_mask |= 1u << i;
         }
         pass_color[i] = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 4) && vk_format(t->format) == b->format
                       ? vk_format(st.rt.cview[i].format) : b->format;
@@ -1519,6 +1546,12 @@ static void begin_pass(void) {
     in_pass = true;
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     stat_passes++;
+    if (vk_diag_enabled()) {
+        NvnTexture *t0p = pass_ncolor && !placed ? st.rt.color[0] : NULL;
+        vk_diag_pass_begin(t0p, minw, minh, t0p ? t0p->format : 0, pass_ncolor,
+                           load_clear_mask, fresh_mask, first_write_mask, level_fresh_mask,
+                           t0p ? renderer_texture_presented(t0p) : false, renderer_exec_frame());
+    }
 }
 
 static void pass_size(int *w, int *h) {
@@ -1693,6 +1726,13 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     VkRect2D rect = scissor_rect();
     if (!rect.extent.width || !rect.extent.height) return;
     if (index >= 0 && (index >= (int)pass_ncolor || pass_color[index] == VK_FORMAT_UNDEFINED)) return;
+    if (vk_diag_enabled()) {
+        NvnTexture *ct = (index >= 0 && index < st.rt.ncolor) ? st.rt.color[index] : NULL;
+        bool fs_clr = ct && rect.offset.x == 0 && rect.offset.y == 0 && rect.extent.width >= pass_w && rect.extent.height >= pass_h;
+        vk_diag_pass_guest_clear(index >= 0, (uint32_t)(index >= 0 ? index : 0), rect.extent.width, rect.extent.height,
+                                 mask, (const float *)color, fs_clr, ct ? renderer_texture_presented(ct) : false,
+                                 renderer_exec_frame());
+    }
     bool simple = (index < 0 || (mask & 0xF) == 0xF) && (!stencil || (smask & 0xFF) == 0xFF);
     if (simple) {
         VkClearAttachment a[2];
@@ -1753,6 +1793,10 @@ typedef struct {
     struct PipeMemo *pmemo;     // (render thread) draw_'s pipeline key memo for this program
     bool reuse;                 // set reuse (stage_set): some uniform buffers are dynamic, sets are kept while their contents repeat
     struct SetCache *scache[2]; // (render thread) stage_set's last set per set index
+    uint64_t diag_created_ns, diag_tr_start_ns, diag_tr_done_ns, diag_spv_start_ns;
+    uint64_t diag_vh, diag_fh, diag_first_skip_f, diag_last_skip_f;
+    uint32_t diag_skips;
+    bool diag_is_prep;
 } Prog;
 
 // ---- descriptor set reuse (graphics programs; port of vk-draw-cpu-2 d50bbce)
@@ -1856,6 +1900,18 @@ static bool spirv_strip_early_tests(uint32_t *w, size_t *nwords) {
     return false;
 }
 
+static void diag_report_prog_done(const Prog *p, uint64_t spv_t0, uint64_t end_ns, int state) {
+    if (!vk_diag_enabled() || p->diag_is_prep || !p->diag_created_ns) return;
+    double q_tr = (double)(p->diag_tr_start_ns - p->diag_created_ns) / 1e6;
+    double tr = (double)(p->diag_tr_done_ns - p->diag_tr_start_ns) / 1e6;
+    double q_spv = spv_t0 ? (double)(spv_t0 - p->diag_spv_start_ns) / 1e6 : 0.0;
+    double spv_mod = spv_t0 ? (double)(end_ns - spv_t0) / 1e6 : 0.0;
+    double total = (double)(end_ns - p->diag_created_ns) / 1e6;
+    vk_diag_prog_done(p->code[0], p->code[1], p->diag_vh, p->diag_fh,
+                      q_tr, tr, q_spv, spv_mod, total,
+                      p->diag_skips, p->diag_first_skip_f, p->diag_last_skip_f, state);
+}
+
 static void compile_program(void *arg) {
     Prog *p = arg;
     uint64_t t0 = SDL_GetTicksNS();
@@ -1863,7 +1919,13 @@ static void compile_program(void *arg) {
     size_t nv = 0, nf = 0;
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
     uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
-    if (!sv || !sf) { free(sv); free(sf); atomic_store(&p->state, 2); build_end(bs); return; }
+    if (!sv || !sf) {
+        free(sv); free(sf);
+        atomic_store(&p->state, 2);
+        build_end(bs);
+        diag_report_prog_done(p, t0, SDL_GetTicksNS(), 2);
+        return;
+    }
     p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
     p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
     p->vs = vk_module(sv, nv);
@@ -1875,8 +1937,10 @@ static void compile_program(void *arg) {
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
     atomic_fetch_add(&stat_compiles, 1);
     if (!p->vs || !p->fs) LOG("[shader] vs/fs %llx %llx: shader module creation failed\n", (unsigned long long)p->code[0], (unsigned long long)p->code[1]);
-    atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
+    int st_val = p->vs && p->fs ? 1 : 2;
+    atomic_store(&p->state, st_val);
     build_end(bs);
+    diag_report_prog_done(p, t0, SDL_GetTicksNS(), st_val);
     slow_build(t0, "modules vs/fs", p->code[0], p->code[1]);
 }
 
@@ -1886,32 +1950,41 @@ static bool translate_program_now(Prog *p) {
     maxwell_gmem_size = HEAP_MAX;
     maxwell_gmem_chunk_shift = gmem_chunk_shift();
     pthread_mutex_lock(&translate_lock);
+    if (vk_diag_enabled()) p->diag_tr_start_ns = SDL_GetTicksNS();
     p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
         p->fkey.vs_out_mask = p->vi->out_mask;
         p->fi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[1], p->cmax[1], STAGE_FRAGMENT, &p->fkey);
     }
+    if (vk_diag_enabled()) p->diag_tr_done_ns = SDL_GetTicksNS();
     pthread_mutex_unlock(&translate_lock);
     if (!p->vi->msl) {
         LOG("[shader] VS translate failed: %s (code %llx)\n", p->vi->error, (unsigned long long)p->code[0]);
         atomic_store(&p->state, 2);
+        diag_report_prog_done(p, 0, p->diag_tr_done_ns, 2);
         return false;
     }
     if (!p->fi->msl) {
         LOG("[shader] FS translate failed: %s\n", p->fi->error);
         atomic_store(&p->state, 2);
+        diag_report_prog_done(p, 0, p->diag_tr_done_ns, 2);
         return false;
     }
     p->vs_uses_vid = strstr(p->vi->msl, "gl_VertexIndex") != NULL;
     return true;
 }
 
-static void translate_program(void *arg) {
-    Prog *p = arg;
+static void translate_and_compile_program(Prog *p, bool sync) {
     if (!translate_program_now(p)) return;
     save_glsl(p->vi->msl, p->code[0], "vs");
     save_glsl(p->fi->msl, p->code[1], "fs");
-    run_job(compile_program, p);
+    if (vk_diag_enabled()) p->diag_spv_start_ns = SDL_GetTicksNS();
+    if (sync) compile_program(p);
+    else run_job(compile_program, p);
+}
+
+static void translate_program(void *arg) {
+    translate_and_compile_program(arg, sync_shaders());
 }
 
 // ================================================================== prepared objects (shader_prep.h)
@@ -2015,8 +2088,9 @@ static Prog *get_program_(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
         prog_fp_check(prog_tab[slot].prog, np);
         return prog_tab[slot].prog;
     }
+    uint64_t vh = 0, fh = 0;
     {   // prepared before the game (the same code and keys)
-        uint64_t vh = shader_stage_hash(&np->stages[0]), fh = shader_stage_hash(&np->stages[1]);
+        vh = shader_stage_hash(&np->stages[0]), fh = shader_stage_hash(&np->stages[1]);
         uint64_t ck = prog_content_key(vh, fh, vkey, fkey);
         Prog *pp = vh && fh && prep_progs_n ? PREP_GET(prep_progs, ck) : NULL;
         if (pp) {
@@ -2037,7 +2111,15 @@ static Prog *get_program_(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     }
     p->vkey = *vkey;
     p->fkey = *fkey;
-    run_translate(translate_program, p);
+    if (vk_diag_enabled()) {
+        p->diag_created_ns = SDL_GetTicksNS();
+        p->diag_vh = vh;
+        p->diag_fh = fh;
+        p->diag_is_prep = false;
+        vk_diag_prog_start(p->code[0], p->code[1], vh, fh, false);
+    }
+    if (wait_shaders_on()) translate_and_compile_program(p, true);
+    else run_translate(translate_program, p);
     return p;
 }
 
@@ -2226,17 +2308,43 @@ typedef struct {
     uint32_t write_mask[8];
 } PipeKey;
 
-typedef struct { PipeKey k; uint64_t hash; VkPipeline pipe; _Atomic int state; } Pipe;  // state: 0 building, 1 ready, 2 failed
+typedef struct {
+    PipeKey k; uint64_t hash; VkPipeline pipe; _Atomic int state;
+    uint64_t diag_created_ns, diag_first_skip_f, diag_last_skip_f;
+    uint32_t diag_skips;
+    bool diag_is_prep;
+} Pipe;  // state: 0 building, 1 ready, 2 failed
+
+static void diag_skip_draw(int why, void *pr_v, void *pp_v, CmdRec *r, bool compute) {
+    if (!vk_diag_enabled()) return;
+    Prog *pr = (Prog *)pr_v;
+    Pipe *pp = (Pipe *)pp_v;
+    extern uint64_t renderer_exec_frame(void);
+    uint64_t f = renderer_exec_frame();
+    if (pr && (why == SK_PROG_BUILDING || why == SK_PROG_FAILED)) {
+        if (!pr->diag_skips) pr->diag_first_skip_f = f;
+        pr->diag_last_skip_f = f;
+        pr->diag_skips++;
+    }
+    if (pp && (why == SK_PIPE_BUILDING || why == SK_PIPE_FAILED)) {
+        if (!pp->diag_skips) pp->diag_first_skip_f = f;
+        pp->diag_last_skip_f = f;
+        pp->diag_skips++;
+    }
+    uint64_t c0 = st.program ? st.program->stages[compute ? 5 : 0].code_addr : 0;
+    uint64_t c1 = st.program && !compute ? st.program->stages[1].code_addr : 0;
+    uint64_t vh = c0 ? shader_stage_hash(&st.program->stages[compute ? 5 : 0]) : 0;
+    uint64_t fh = c1 ? shader_stage_hash(&st.program->stages[1]) : 0;
+    NvnTexture *rt0 = st.rt.ncolor ? st.rt.color[0] : NULL;
+    bool fs_quad = !compute && r && rt0 && r->x[2] <= 6 && st.viewport[0][0] == 0 && st.viewport[0][1] == 0 &&
+                   st.viewport[0][2] >= rt0->width && st.viewport[0][3] >= rt0->height;
+    vk_diag_skip(why, c0, c1, vh, fh, rt0, rt0 ? rt0->width : 0, rt0 ? rt0->height : 0,
+                 rt0 ? rt0->format : 0, rt0 ? renderer_texture_presented(rt0) : false, fs_quad, f);
+}
 // (record.c, at the bind) the pipeline of a Pipe: NULL while it builds (wait: sleeps until it is done) or failed
 static VkPipeline pipe_resolve(void *obj, bool wait) {
     Pipe *pp = obj;
-    int st_;
-    while ((st_ = atomic_load(&pp->state)) == 0) {
-        if (!wait) return VK_NULL_HANDLE;
-        struct timespec ts = {0, 200000};
-        nanosleep(&ts, NULL);
-    }
-    return st_ == 1 ? pp->pipe : VK_NULL_HANDLE;
+    return await_ready_state(&pp->state, wait) == 1 ? pp->pipe : VK_NULL_HANDLE;
 }
 // (key memo, see get_program) everything pipe_key_fill reads besides the program: the pass's formats and the PipeIn.
 // One per program (draws often alternate between a few programs): the last pipeline that program drew with.
@@ -2438,7 +2546,13 @@ static void build_pipeline(void *arg) {
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
     }
     atomic_fetch_add(&stat_compiles, 1);
-    atomic_store(&pp->state, r == VK_SUCCESS ? 1 : 2);
+    int pst = r == VK_SUCCESS ? 1 : 2;
+    atomic_store(&pp->state, pst);
+    if (vk_diag_enabled()) {
+        bool chit = (fb_.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0;
+        vk_diag_pipe_done(k->prog->code[0], k->prog->code[1], (double)(SDL_GetTicksNS() - t0) / 1e6, chit, pst,
+                          pp->diag_skips, pp->diag_first_skip_f, pp->diag_last_skip_f, pp->diag_is_prep);
+    }
     slow_build(t0, "pipeline vs/fs", k->prog->code[0], k->prog->code[1]);
 }
 
@@ -3226,7 +3340,7 @@ static uint64_t snap_storage(uint64_t addr, uint64_t size, bool cs_slot) {
     // after the half is left and taken again (the wait in ring_take), as a remade copy's old slot.
     if (!cs_slot && (pf & 0x13) == 0x12 && size <= 65536) {
         uint64_t at = ring_take((size + 255) & ~255ull);
-        if (!at) return addr;
+        if (!at) { vk_diag_mem_event("snap_ring_full_draw", addr, size, f); return addr; }
         memcpy((void *)(uintptr_t)at, (const void *)(uintptr_t)addr, size);
         stat_snap_bytes += size;
         stat_snap_copies++;
@@ -3240,6 +3354,7 @@ static uint64_t snap_storage(uint64_t addr, uint64_t size, bool cs_slot) {
         if (nrs == 512) {  // table full: the entry bound longest ago makes room (never the whole table at once)
             k = 0;
             for (int i = 1; i < nrs; i++) if (rs_tab[i].frame < rs_tab[k].frame) k = i;
+            vk_diag_mem_event("rs_tab_evict", rs_tab[k].addr, rs_tab[k].size, f);
             rs_log(&rs_tab[k], "evicted (table full, bound longest ago)", cs_slot, f);
         } else nrs++;
         e = &rs_tab[k];
@@ -4884,6 +4999,8 @@ static void shadow_slot_check(int stage, const ShaderTexture *st_, int i, uint64
     *view = vk_dummy_depth_view(st_->type);
 }
 
+static bool g_diag_bad_tex_in_draw;
+
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2], float fr[2]) {
     ShaderTexture *st_ = &si->tex[i];
     int slot = ((int)st_->handle_offset - 0x20) / 8;  // 64-bit handles from offset 0x20
@@ -4926,11 +5043,25 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
                 }
         } else if (e->dead_format) {
             nvn_dead_slot_sampled(e, tic);
+            if (vk_diag_enabled()) {
+                vk_diag_dead_slot_sampled(tic, e->dead_format - 1, g_cur_fs_hash, vk_frame_counter());
+                g_diag_bad_tex_in_draw = true;
+            }
+        } else if (vk_diag_enabled()) {
+            vk_diag_bad_tex_bind("empty_pool_slot", tic, h, NULL, 0, 0, 0, vk_frame_counter());
+            g_diag_bad_tex_in_draw = true;
         }
+    } else if (h && vk_diag_enabled()) {
+        vk_diag_bad_tex_bind(!st.tpool ? "no_tpool" : "tic_oob", tic, h, NULL, 0, 0, 0, vk_frame_counter());
+        g_diag_bad_tex_in_draw = true;
     }
     if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc]);
     if (st_->shadow)
         shadow_slot_check(stage, st_, i, h, tic, ent, ent && ent->tex ? (naliases ? alias_read(ent->tex) : ent->tex) : NULL, &view);
+    if (vk_diag_enabled() && h && ent && ent->tex && !st_->shadow && (!view || view == vk_dummy_view(st_->type))) {
+        vk_diag_bad_tex_bind("dummy_fallback", tic, h, ent->tex, ent->tex->width, ent->tex->height, ent->tex->format, vk_frame_counter());
+        g_diag_bad_tex_in_draw = true;
+    }
     if (!view) view = vk_dummy_view(st_->type);
     if (!smp) smp = vk_default_sampler(true);
     *out = (VkDescriptorImageInfo){smp, view, VK_IMAGE_LAYOUT_GENERAL};
@@ -5158,7 +5289,8 @@ static CsProg *compute_program(NvnProgram *np) {
     if (!translate_compute(cp, (const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, ss->code_addr))
         return cp;
     save_glsl(cp->si->msl, ss->code_addr, "cs");
-    run_job(build_compute, cp);
+    if (wait_shaders_on()) build_compute(cp);
+    else run_job(build_compute, cp);
     return cp;
 }
 
@@ -5184,6 +5316,14 @@ bool renderer_prepare_begin(void) { return g_vk.dev != VK_NULL_HANDLE; }
 int renderer_prepare_pending(void) { return prep_pending; }
 static void gpl_probe(void);
 static void gpl_probe_note(Pipe *pp);
+void vk_exec_prep_counts(size_t *progs, size_t *pipes, size_t *cs) {
+    pthread_mutex_lock(&prep_lock);
+    if (progs) *progs = prep_progs_n;
+    if (pipes) *pipes = prep_pipes_n;
+    if (cs) *cs = prep_cs_n;
+    pthread_mutex_unlock(&prep_lock);
+}
+
 void renderer_prepare_end(void) {
     vk_pipeline_cache_save();  // (otherwise only kept at exit)
     static bool logged;        // (the counts: once per process, the background preparation runs once)
@@ -5270,16 +5410,23 @@ bool renderer_prepare(const ShaderRec *r, const ShaderBlob *vsb, const ShaderBlo
         p->vkey = vkey;
         p->fkey = fkey;
         p->prep_vh = r->vs, p->prep_fh = r->fs;
+        p->diag_is_prep = true;
+        p->diag_created_ns = SDL_GetTicksNS();
+        p->diag_vh = r->vs; p->diag_fh = r->fs;
+        vk_diag_prog_start(0, 0, r->vs, r->fs, true);
         bool ok = translate_program_now(p);
         p->code[0] = p->code[1] = 0;  // (the game files' copies are gone after this call)
         PREP_PUT(prep_progs, ck, p);  // (failed ones too: the game then skips them as it would its own)
         if (!ok) return false;
+        p->diag_spv_start_ns = SDL_GetTicksNS();
         prep_job(compile_program, p);
     }
     if (atomic_load(&p->state) == 2) return false;
     PrepPipe *a = calloc(1, sizeof *a);
     a->pp = calloc(1, sizeof *a->pp);
     a->pp->k.prog = p;
+    a->pp->diag_is_prep = true;
+    a->pp->diag_created_ns = SDL_GetTicksNS();
     a->r = *r;
     prep_job(prep_pipeline, a);
     return true;
@@ -5403,7 +5550,8 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
     CsProg *cp = compute_program(st.program);
-    if (!cp || atomic_load(&cp->p.state) != 1) { SKIP_CS(!cp ? SK_NO_STAGES : atomic_load(&cp->p.state) == 2 ? SK_CS_FAILED : SK_CS_BUILDING); return; }
+    int cs_st = cp ? await_ready_state(&cp->p.state, wait_shaders_on()) : 0;
+    if (cs_st != 1) { SKIP_CS(!cp ? SK_NO_STAGES : cs_st == 2 ? SK_CS_FAILED : SK_CS_BUILDING); return; }
     {   // LARECOMP_SKIP_CS=<code address hex> (debug): skip that compute shader's dispatches, to see what it does
         static uint64_t skip = ~0ull;
         if (skip == ~0ull) { const char *e = getenv("LARECOMP_SKIP_CS"); skip = e ? strtoull(e, NULL, 16) : 0; }
@@ -5589,6 +5737,14 @@ static void prep_check(const PipeKey *k, uint64_t vh, uint64_t fh, const ShaderR
         k->prog->prep_vh ? "prepared" : "not prepared", progs, nprep, best ? diff : " (none)", line);
 }
 
+static Prog *draw_program_ready(CmdRec *r, NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
+    Prog *pr = get_program(np, vkey, fkey);
+    int ps = pr ? await_ready_state(&pr->state, wait_shaders_on()) : 0;
+    if (ps == 1) return pr;
+    SKIP_EX(!pr ? SK_NO_STAGES : ps == 2 ? SK_PROG_FAILED : SK_PROG_BUILDING, pr, NULL);
+    return NULL;
+}
+
 static void draw_(CmdRec *r, bool indexed);
 static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
@@ -5598,6 +5754,7 @@ static void draw(CmdRec *r, bool indexed) {
 static uint64_t prof_tp_;
 static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tp_ = SDL_GetTicksNS();
+    g_diag_bad_tex_in_draw = false;
     if (!st.program) { SKIP(SK_NO_PROGRAM); return; }
     ShaderKey vkey = {0}, fkey = {0};
     vkey.glsl = fkey.glsl = 1;
@@ -5605,8 +5762,8 @@ static void draw_(CmdRec *r, bool indexed) {
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
-    Prog *pr = get_program(st.program, &vkey, &fkey);
-    if (!pr || atomic_load(&pr->state) != 1) { SKIP(!pr ? SK_NO_STAGES : atomic_load(&pr->state) == 2 ? SK_PROG_FAILED : SK_PROG_BUILDING); return; }
+    Prog *pr = draw_program_ready(r, st.program, &vkey, &fkey);
+    if (!pr) return;
     g_mirror_w = 0;
     {   // mirror mode (runtime/hle/mirror.c; as renderer.m): the scene's composite into the window image is mirrored
         extern bool mirror_draw(bool composite);
@@ -5622,8 +5779,8 @@ static void draw_(CmdRec *r, bool indexed) {
         }
         if (mirror_draw(composite)) {
             vkey.flip_x = fkey.flip_x = true;
-            pr = get_program(st.program, &vkey, &fkey);
-            if (!pr || atomic_load(&pr->state) != 1) { SKIP(!pr ? SK_NO_STAGES : atomic_load(&pr->state) == 2 ? SK_PROG_FAILED : SK_PROG_BUILDING); return; }
+            pr = draw_program_ready(r, st.program, &vkey, &fkey);
+            if (!pr) return;
             g_mirror_w = (float)st.rt.color[0]->width;
         }
     }
@@ -5723,6 +5880,8 @@ static void draw_(CmdRec *r, bool indexed) {
                 }
                 pp = calloc(1, sizeof *pp);
                 pp->k = k;
+                pp->diag_created_ns = SDL_GetTicksNS();
+                pp->diag_is_prep = false;
                 run_job(build_pipeline, pp);
             }
             pipe_tab[pslot].key = ph;
@@ -5742,8 +5901,8 @@ static void draw_(CmdRec *r, bool indexed) {
     {   // a pipeline still building: the draw is skipped (as on Metal), unless the recorder waits for it at the bind
         // (LARECOMP_VK_RECORDER_WAIT_PIPES=1, record.c: pipe_resolve); one that failed is always skipped
         int ps = atomic_load(&pp->state);
-        if (ps == 2) { SKIP(SK_PIPE_FAILED); return; }
-        if (ps != 1 && !rec_wait_pipes()) { SKIP(SK_PIPE_BUILDING); return; }
+        if (ps == 2) { SKIP_EX(SK_PIPE_FAILED, pr, pp); return; }
+        if (ps != 1 && !rec_wait_pipes()) { SKIP_EX(SK_PIPE_BUILDING, pr, pp); return; }
     }
     ss_enabled();
     if (ss_need(SS_PIPE, ss.pipe == pp)) { ss.pipe = pp; rec_CmdBindPipelineObj(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp); }
@@ -6113,6 +6272,16 @@ static void draw_(CmdRec *r, bool indexed) {
     stat_draws++;
     atomic_fetch_add_explicit(&hud_total_draws, 1, memory_order_relaxed);
     cum_draws++;
+    if (vk_diag_enabled()) {
+        VkRect2D dsc = (ss_on && (ss.known & SS_SC)) ? ss.sc : scissor_rect();
+        bool zsc = dsc.extent.width == 0 || dsc.extent.height == 0;
+        bool zvp = st.viewport[0][2] <= 0 || st.viewport[0][3] <= 0;
+        bool nowr = pass_ncolor > 0 && ((st.channel_mask & 0xF) == 0) && !(st.ds[0] && st.ds[1]) && !st.ds[3];
+        NvnTexture *rt0 = st.rt.ncolor ? st.rt.color[0] : NULL;
+        extern uint64_t renderer_exec_frame(void);
+        vk_diag_draw_executed(g_diag_bad_tex_in_draw, zsc, zvp, nowr, rt0, pass_w, pass_h,
+                              rt0 ? renderer_texture_presented(rt0) : false, g_cur_fs_hash, renderer_exec_frame());
+    }
     if (g_gpuprof_frame && gp_n) {
         if (!gp_draws[gp_n - 1]) {  // first draw of the row: its fragment shader hash
             size_t l = strlen(gp_label[gp_n - 1]);
@@ -7129,6 +7298,7 @@ static void exec_list(uint64_t handle, int depth) {
             // merge them into a composite program so draws see both stages)
             static NvnProgram merged;
             NvnProgram *p = (NvnProgram *)(uintptr_t)r->x[0];
+            if (!p) { vk_diag_mem_event("bind_program_null", r->x[0], 0, renderer_exec_frame()); break; }
             if (p->stage_mask & 1) merged.stages[0] = p->stages[0];
             if (p->stage_mask & 2) merged.stages[1] = p->stages[1];
             if (p->stage_mask & 4) merged.stages[2] = p->stages[2];

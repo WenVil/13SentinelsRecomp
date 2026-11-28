@@ -19,6 +19,7 @@
 #include "../renderer.h"
 #include "../pace.h"
 #include "../shader_prep.h"
+#include "render_diag.h"
 #include "shaders.h"
 #include <pthread.h>
 
@@ -742,9 +743,16 @@ bool vk_frame_begin(const float clear[4]) {
     int cur_vsync = g_settings.vsync_mode, cur_accel = rt_speed_mult() > 1;
     bool vsync_changed = last_vsync >= 0 && (cur_vsync != last_vsync || cur_accel != last_accel);
     last_vsync = cur_vsync, last_accel = cur_accel;
-    if (atomic_exchange_explicit(&g_want_swapchain_recreate, false, memory_order_acq_rel) || vsync_changed || rec_present_recreate())
+    if (atomic_exchange_explicit(&g_want_swapchain_recreate, false, memory_order_acq_rel) || vsync_changed || rec_present_recreate()) {
+        extern uint64_t vk_frame_counter(void);
+        vk_diag_swapchain_event("recreate_req", vsync_changed ? 1 : 0, (uint32_t)w, (uint32_t)h, vk_frame_counter());
         recreate_swapchain();
-    if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height) recreate_swapchain();
+    }
+    if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height) {
+        extern uint64_t vk_frame_counter(void);
+        vk_diag_swapchain_event("recreate_resize", 0, (uint32_t)w, (uint32_t)h, vk_frame_counter());
+        recreate_swapchain();
+    }
     if (!g_vk.swapchain) return false;
     static int trace = -1;
     if (trace < 0) trace = getenv("LARECOMP_VK_TRACE") != NULL;
@@ -755,11 +763,18 @@ bool vk_frame_begin(const float clear[4]) {
     VkResult r;
     WAITING_AT(1, r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image));
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+        extern uint64_t vk_frame_counter(void);
+        vk_diag_swapchain_event("acquire_out_of_date", r, (uint32_t)w, (uint32_t)h, vk_frame_counter());
         recreate_swapchain();
         WAITING_AT(1, r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE,
                                           &cur_frame.image));
     }
-    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LOG("[vk] acquire failed: %d\n", r); return false; }
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+        extern uint64_t vk_frame_counter(void);
+        vk_diag_swapchain_event("acquire_failed", r, (uint32_t)w, (uint32_t)h, vk_frame_counter());
+        LOG("[vk] acquire failed: %d\n", r);
+        return false;
+    }
     cur_frame.acquired = acquire_sem[slot];
     cur_frame.id++;
     cur_frame.secondary = false;
@@ -1207,6 +1222,15 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
     if (hitch_ms < 0) hitch_ms = getenv("LARECOMP_LOG_HITCH_MS") ? atof(getenv("LARECOMP_LOG_HITCH_MS")) : 0;
     if (hitch_ms > 0 && prev_present > 0 && (now - prev_present) * 1000 > hitch_ms)
         LOG("[hitch] t=%.2f frame %llu gap %.0f ms\n", now, (unsigned long long)frame, (now - prev_present) * 1000);
+    if (vk_diag_enabled()) {
+        extern const char *game_level_name(void);
+        extern void vk_exec_prep_counts(size_t *progs, size_t *pipes, size_t *cs);
+        size_t pp_n = 0, pi_n = 0, cs_n = 0;
+        vk_exec_prep_counts(&pp_n, &pi_n, &cs_n);
+        double gap_ms = prev_present > 0 ? (now - prev_present) * 1000.0 : 0.0;
+        vk_diag_frame_end(frame, gap_ms, (double)nd / 1e6, t, t ? t->width : 0, t ? t->height : 0, t ? t->format : 0,
+                          pp_n, pi_n, cs_n, game_level_name());
+    }
     prev_present = now;
     pp_mark(PP_REST);  // (the fps line itself is not counted)
     if (now - last_fps_time >= fps_iv) {
@@ -1323,6 +1347,7 @@ void backend_quit(void) {
     vkDeviceWaitIdle(g_vk.dev);
     if (trace) LOG("[vk] quit: saving the pipeline cache\n");
     vk_pipeline_cache_save();
+    vk_diag_shutdown();
 }
 
 // exit() from any thread: backend_quit (when the window close didn't already), then end the process without the DLL
